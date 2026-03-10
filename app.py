@@ -9,18 +9,18 @@ import json
 app = Flask(__name__)
 app.secret_key = "stocker_secret_2024"
 
-# ================= AWS CONFIGURATION (IAM ROLE) =================
+# ---------------- AWS CONFIGURATION (IAM ROLE ONLY) ---------------- #
 
 AWS_REGION = "us-east-1"
 
-# Use IAM Role attached to EC2
-session_aws = boto3.Session(region_name=AWS_REGION)
+# boto3 will automatically use the IAM Role attached to EC2
+boto3_session = boto3.Session(region_name=AWS_REGION)
 
-# DynamoDB
-dynamodb = session_aws.resource('dynamodb')
+# DynamoDB resource
+dynamodb = boto3_session.resource('dynamodb')
 
-# SNS
-sns = session_aws.client('sns')
+# SNS client
+sns = boto3_session.client('sns')
 
 # DynamoDB Tables
 USER_TABLE = "stocker_users"
@@ -33,7 +33,7 @@ USER_ACCOUNT_TOPIC_ARN = "arn:aws:sns:us-east-1:604665149129:StockerUserAccountT
 TRANSACTION_TOPIC_ARN = "arn:aws:sns:us-east-1:604665149129:StockerTransactionTopic"
 
 
-# ================= HELPER CLASSES =================
+# ---------------- HELPER CLASSES ---------------- #
 
 class DecimalEncoder(json.JSONEncoder):
     def default(self, o):
@@ -42,24 +42,35 @@ class DecimalEncoder(json.JSONEncoder):
         return super().default(o)
 
 
-# ================= SNS FUNCTION =================
+# ---------------- SNS FUNCTION ---------------- #
 
-def send_notification(topic_arn, subject, message):
+def send_notification(topic_arn, subject, message, attributes=None):
+
+    if not topic_arn:
+        return False
 
     try:
 
-        sns.publish(
-            TopicArn=topic_arn,
-            Subject=subject,
-            Message=message
-        )
+        kwargs = {
+            "TopicArn": topic_arn,
+            "Subject": subject,
+            "Message": message
+        }
+
+        if attributes:
+            kwargs["MessageAttributes"] = attributes
+
+        sns.publish(**kwargs)
+
+        return True
 
     except Exception as e:
 
         print("SNS Error:", e)
+        return False
 
 
-# ================= DATABASE FUNCTIONS =================
+# ---------------- DATABASE FUNCTIONS ---------------- #
 
 def get_user_by_email(email):
 
@@ -202,7 +213,7 @@ def get_portfolio_item(user_id, stock_id):
     return response.get("Item")
 
 
-def create_transaction(user_id, stock_id, action, quantity, price):
+def create_transaction(user_id, stock_id, action, quantity, price, status='completed'):
 
     table = dynamodb.Table(TRANSACTION_TABLE)
 
@@ -220,9 +231,10 @@ def create_transaction(user_id, stock_id, action, quantity, price):
 
         "price": Decimal(str(price)),
 
-        "status": "completed",
+        "status": status,
 
         "transaction_date": datetime.now().isoformat()
+
     }
 
     table.put_item(Item=transaction)
@@ -253,7 +265,9 @@ def update_portfolio(user_id, stock_id, quantity, average_price):
                 ":q": quantity,
 
                 ":p": average_price
+
             }
+
         )
 
     elif existing and quantity <= 0:
@@ -261,6 +275,7 @@ def update_portfolio(user_id, stock_id, quantity, average_price):
         table.delete_item(
 
             Key={"user_id": user_id, "stock_id": stock_id}
+
         )
 
     elif quantity > 0:
@@ -276,128 +291,139 @@ def update_portfolio(user_id, stock_id, quantity, average_price):
                 "quantity": quantity,
 
                 "average_price": average_price
+
             }
+
         )
 
 
-# ================= ROUTES =================
+# ------------------- Routes ------------------- #
 
 @app.route('/')
 def index():
-    return render_template("index.html")
+    return render_template('index.html')
 
-
-@app.route('/login', methods=["GET", "POST"])
+@app.route('/login', methods=['GET', 'POST'])
 def login():
 
-    if request.method == "POST":
+    if request.method == 'POST':
 
-        email = request.form["email"]
-
-        password = request.form["password"]
-
-        role = request.form["role"]
+        role = request.form.get('role')
+        email = request.form.get('email')
+        password = request.form.get('password')
 
         user = get_user_by_email(email)
 
-        if user and user["password"] == password and user["role"] == role:
+        if user and user['password'] == password and user['role'] == role:
 
-            session["email"] = user["email"]
+            session['email'] = user['email']
+            session['role'] = user['role']
+            session['user_id'] = user['id']
 
-            session["role"] = user["role"]
+            flash('Login successful!', 'success')
 
-            session["user_id"] = user["id"]
+            return redirect(url_for('dashboard_admin' if role == 'admin' else 'dashboard_trader'))
 
-            send_notification(
+        flash('Invalid credentials', 'danger')
 
-                USER_ACCOUNT_TOPIC_ARN,
-
-                "User Login",
-
-                f"{user['username']} logged in"
-
-            )
-
-            if role == "admin":
-
-                return redirect(url_for("dashboard_admin"))
-
-            else:
-
-                return redirect(url_for("dashboard_trader"))
-
-        flash("Invalid credentials")
-
-    return render_template("login.html")
+    return render_template('login.html')
 
 
-@app.route('/signup', methods=["GET", "POST"])
+@app.route('/signup', methods=['GET', 'POST'])
 def signup():
 
-    if request.method == "POST":
+    if request.method == 'POST':
 
-        username = request.form["username"]
-
-        email = request.form["email"]
-
-        password = request.form["password"]
-
-        role = request.form["role"]
+        username = request.form['username']
+        email = request.form['email']
+        password = request.form['password']
+        role = request.form['role']
 
         if get_user_by_email(email):
 
-            flash("User already exists")
-
-            return redirect(url_for("login"))
+            flash('User already exists', 'warning')
+            return redirect(url_for('login'))
 
         create_user(username, email, password, role)
 
-        send_notification(
+        flash('Account created', 'success')
 
-            USER_ACCOUNT_TOPIC_ARN,
+        return redirect(url_for('login'))
 
-            "New User Signup",
-
-            f"{username} created an account"
-        )
-
-        return redirect(url_for("login"))
-
-    return render_template("signup.html")
+    return render_template('signup.html')
 
 
 @app.route('/dashboard_admin')
 def dashboard_admin():
 
+    user = get_user_by_email(session['email'])
     stocks = get_all_stocks()
 
-    user = get_user_by_email(session["email"])
-
-    return render_template(
-
-        "dashboard_admin.html",
-
-        user=user,
-
-        market_data=stocks
-    )
+    return render_template('dashboard_admin.html', user=user, market_data=stocks)
 
 
 @app.route('/dashboard_trader')
 def dashboard_trader():
 
+    user = get_user_by_email(session['email'])
     stocks = get_all_stocks()
 
-    user = get_user_by_email(session["email"])
+    return render_template('dashboard_trader.html', user=user, market_data=stocks)
 
-    return render_template(
 
-        "dashboard_trader.html",
+# ---------------- SERVICE 01 ---------------- #
 
-        user=user,
+@app.route('/service01')
+def service01():
 
-        market_data=stocks
-    )
+    traders = get_traders()
+
+    return render_template('service-details-1.html', traders=traders)
+
+
+# ---------------- SERVICE 02 ---------------- #
+
+@app.route('/service02')
+def service02():
+
+    transactions = get_transactions()
+
+    return render_template('service-details-2.html', transactions=transactions)
+
+
+# ---------------- SERVICE 03 ---------------- #
+
+@app.route('/service03')
+def service03():
+
+    portfolios = get_portfolios()
+
+    return render_template('service-details-3.html', portfolios=portfolios)
+
+
+# ---------------- SERVICE 04 ---------------- #
+
+@app.route('/service04')
+def service04():
+
+    user = get_user_by_email(session['email'])
+    stocks = get_all_stocks()
+
+    return render_template('service-details-4.html', user=user, stocks=stocks)
+
+
+# ---------------- SERVICE 05 ---------------- #
+
+@app.route('/service05')
+def service05():
+
+    user = get_user_by_email(session['email'])
+
+    portfolio = get_user_portfolio(user['id'])
+
+    transactions = get_transactions()
+
+    return render_template('service-details-5.html', user=user, portfolio=portfolio, transactions=transactions)
 
 
 @app.route('/logout')
@@ -405,11 +431,13 @@ def logout():
 
     session.clear()
 
-    return redirect(url_for("index"))
+    flash('You have been logged out.', 'info')
+
+    return redirect(url_for('index'))
 
 
-# ================= RUN =================
+# ---------------- RUN ---------------- #
 
-if __name__ == "__main__":
+if __name__ == '__main__':
 
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5000)
